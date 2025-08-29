@@ -2,13 +2,32 @@ name: Newsletter Diária
 
 on:
   schedule:
-    - cron: '0 10 * * *'  # 07:00 America/Sao_Paulo (UTC-3)
+    # 07:00 America/Sao_Paulo ≈ 10:00 UTC (ajuste se houver mudança de horário de verão)
+    - cron: '0 10 * * *'
   workflow_dispatch:
+    inputs:
+      force_send_anytime:
+        description: 'Forçar envio fora do horário (define FORCE_SEND_ANYTIME=1)'
+        required: false
+        default: 'false'
+      run_verbose:
+        description: 'Verbose extra no job'
+        required: false
+        default: 'false'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: newsletter-daily
+  cancel-in-progress: false
 
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     env:
+      # --- Credenciais (defina em Settings > Secrets and variables > Actions) ---
       ESTADAO_USER: ${{ secrets.ESTADAO_USER }}
       ESTADAO_PASS: ${{ secrets.ESTADAO_PASS }}
       VALOR_USER:   ${{ secrets.VALOR_USER }}
@@ -20,16 +39,23 @@ jobs:
       EMAIL_USER:   ${{ secrets.EMAIL_USER }}
       EMAIL_PASS:   ${{ secrets.EMAIL_PASS }}
       DEST_EMAIL:   ${{ secrets.DEST_EMAIL }}
+
+      # --- SMTP opcional (se não usar Gmail padrão) ---
+      EMAIL_SMTP_HOST:      ${{ secrets.EMAIL_SMTP_HOST }}      # ex.: smtp.sendgrid.net
+      EMAIL_SMTP_SSL_PORT:  ${{ secrets.EMAIL_SMTP_SSL_PORT }}  # ex.: 465
+      EMAIL_SMTP_TLS_PORT:  ${{ secrets.EMAIL_SMTP_TLS_PORT }}  # ex.: 587
+
     steps:
       - name: Checkout do código
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Configurar Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
 
-      - name: Instalar Chrome e Chromedriver
+      - name: Instalar Chromium e Chromedriver
         run: |
           sudo apt-get update
           sudo apt-get install -y chromium-browser chromium-chromedriver
@@ -39,7 +65,20 @@ jobs:
           which chromedriver || true
 
       - name: Instalar dependências
-        run: pip install -r requirements.txt
+        run: |
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Definir variáveis de execução (FORCE_SEND_ANYTIME / verbose)
+        run: |
+          if [ "${{ github.event.inputs.force_send_anytime || 'false' }}" = "true" ]; then
+            echo "FORCE_SEND_ANYTIME=1" >> $GITHUB_ENV
+          fi
+          if [ "${{ github.event.inputs.run_verbose || 'false' }}" = "true" ]; then
+            echo "PYTHONWARNINGS=default" >> $GITHUB_ENV
+          fi
 
       - name: Executar script
-        run: python newsletter.py
+        run: |
+          python -V
+          python newsletter.py
+
