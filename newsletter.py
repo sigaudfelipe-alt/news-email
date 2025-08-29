@@ -5,14 +5,14 @@
 Gera e envia uma newsletter diária.
 - Lê credenciais via variáveis de ambiente (GitHub Secrets)
 - Usa Selenium (Chrome headless) com CHROME_BIN/CHROMEDRIVER_BIN
-- Coleta links das seções definidas, resolve URLs relativas, relaxa filtros de título
-- Para NYT, tem fallback via RSS se a página HTML não retornar links
+- Coleta links das seções definidas (requests -> fallback Selenium)
+- Resolve URLs relativas, relaxa filtros de título
+- Para NYT, fallback via RSS se a página HTML não retornar links
 - Monta HTML e envia por SMTP
 """
 
 import os
 import sys
-import time
 import smtplib
 import traceback
 from urllib.parse import urljoin
@@ -40,7 +40,7 @@ SECTIONS = {
     "Valor": {
         "Primeiro Caderno": "https://valor.globo.com/brasil/",
         "Empresas": "https://valor.globo.com/empresas/",
-        "Finanças": "https://valor.globo.com/financas/",   # <- garantido
+        "Finanças": "https://valor.globo.com/financas/",  # garantido
     },
     "O Globo": {
         "Primeiro Caderno": "https://oglobo.globo.com/brasil/",
@@ -71,9 +71,15 @@ HEALTH_KEYWORDS = {
     "insurance",
 }
 
-USER_AGENT = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                            "(KHTML, like Gecko) Chrome/125.0 Safari/537.36"}
+USER_AGENT = {
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/125.0 Safari/537.36"
+    )
+}
 
+
+# ===================== Driver Chrome (estável no CI) =====================
 
 def get_driver():
     """Inicializa o Chrome headless pegando caminhos do ambiente do GitHub Actions."""
@@ -83,23 +89,45 @@ def get_driver():
     opts = Options()
     if chrome_path:
         opts.binary_location = chrome_path
+
+    # Flags para estabilidade/performance em ambiente CI
     opts.add_argument("--headless=new")
     opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-gpu")
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--window-size=1366,900")
+    opts.add_argument("--disable-renderer-backgrounding")
+    opts.add_argument("--disable-background-timer-throttling")
+    opts.add_argument("--disable-backgrounding-occluded-windows")
+    opts.add_argument("--disable-features=TranslateUI,BlinkGenPropertyTrees,AutomationControlled")
+    opts.add_argument("--remote-debugging-port=9222")
+
+    # Bloquear imagens para carregar mais rápido
+    prefs = {
+        "profile.managed_default_content_settings.images": 2,
+        "profile.default_content_setting_values.cookies": 1,
+        "disk-cache-size": 4096,
+    }
+    opts.add_experimental_option("prefs", prefs)
+
+    # Não esperar todos os recursos pesados
+    opts.page_load_strategy = "eager"
+
     service = Service(chromedriver_path)
     driver = webdriver.Chrome(service=service, options=opts)
-    driver.set_page_load_timeout(60)
+    driver.set_page_load_timeout(90)
+    driver.implicitly_wait(0)
     return driver
 
 
+# ===================== Login (opcional; ajustar se quiser) =====================
+
 def login_paywall_examples(driver):
     """
-    PONTOS DE AJUSTE (opcional):
     Se quiser efetuar login em cada site, implemente aqui as rotinas específicas.
-    Credenciais vêm de variáveis de ambiente (GitHub Secrets).
+    Credenciais via variáveis de ambiente (GitHub Secrets).
     """
-    # Exemplo de esqueleto (comentado):
+    # Exemplo (comentado):
     # est_user = os.getenv("ESTADAO_USER"); est_pass = os.getenv("ESTADAO_PASS")
     # driver.get("https://accounts.estadao.com.br/login")
     # WebDriverWait(driver, 20).until(
@@ -109,30 +137,17 @@ def login_paywall_examples(driver):
     pass
 
 
-def fetch_links_simple(driver, url, max_items=6):
-    """
-    Coleta links/títulos de uma página de seção.
-    - Resolve links relativos (urljoin)
-    - Relaxa filtros de título (>= 20 chars)
-    - Remove duplicados e ignora rotas de login/assinatura/anchors
-    """
-    driver.get(url)
-    WebDriverWait(driver, 25).until(
-        EC.presence_of_all_elements_located((By.TAG_NAME, "a"))
-    )
+# ===================== Coleta de links (requests -> fallback Selenium) =====================
 
-    html = driver.page_source
-    soup = BeautifulSoup(html, "lxml")
-
-    seen = set()
-    items = []
+def _filter_links(url_base, soup, max_items=6):
+    """Filtra e normaliza anchors para (title, full_url)."""
+    seen, items = set(), []
     for a in soup.select("a[href]"):
         title = (a.get_text() or "").strip()
         href = a.get("href")
         if not href or not title:
             continue
-
-        full = urljoin(url, href)  # resolve relativo -> absoluto
+        full = urljoin(url_base, href)  # resolve relativo -> absoluto
 
         # filtros básicos
         if len(title) < 20:
@@ -145,26 +160,44 @@ def fetch_links_simple(driver, url, max_items=6):
             items.append((title, full))
             if len(items) >= max_items:
                 break
-
     return items
 
 
-def fetch_rss_fallback(feed_url, max_items=6):
+def fetch_links_via_requests(url, max_items=6):
+    """Primeira tentativa: pegar links via requests+BS (sem renderer)."""
     try:
-        r = requests.get(feed_url, timeout=20, headers=USER_AGENT)
+        r = requests.get(url, timeout=20, headers=USER_AGENT)
         if r.status_code != 200:
             return []
-        soup = BeautifulSoup(r.text, "xml")
-        out = []
-        for item in soup.select("item")[:max_items]:
-            title = item.title.get_text(strip=True) if item.title else ""
-            link = item.link.get_text(strip=True) if item.link else ""
-            if title and link:
-                out.append((title, link))
-        return out
+        soup = BeautifulSoup(r.text, "lxml")
+        return _filter_links(url, soup, max_items=max_items)
     except Exception:
         return []
 
+
+def fetch_links_via_selenium(driver, url, max_items=6):
+    """Segunda tentativa: Selenium (casos mais dinâmicos)."""
+    try:
+        driver.get(url)
+        WebDriverWait(driver, 15).until(
+            EC.presence_of_element_located((By.TAG_NAME, "a"))
+        )
+        html = driver.page_source
+        soup = BeautifulSoup(html, "lxml")
+        return _filter_links(url, soup, max_items=max_items)
+    except Exception:
+        return []
+
+
+def fetch_links_simple(driver, url, max_items=6):
+    """Wrapper: tenta requests antes; se vazio, usa Selenium."""
+    links = fetch_links_via_requests(url, max_items=max_items)
+    if links:
+        return links
+    return fetch_links_via_selenium(driver, url, max_items=max_items)
+
+
+# ===================== Download + resumo =====================
 
 def download_article_text(url, timeout=25):
     """Baixa conteúdo bruto (sem login) para gerar resumo. Ajuste conforme necessidade."""
@@ -173,7 +206,6 @@ def download_article_text(url, timeout=25):
         if r.status_code != 200:
             return ""
         soup = BeautifulSoup(r.text, "lxml")
-        # pega parágrafos do corpo comum
         paras = [p.get_text(" ", strip=True) for p in soup.select("article p")]
         if not paras:
             paras = [p.get_text(" ", strip=True) for p in soup.select("p")]
@@ -194,10 +226,11 @@ def summarize_text(text, max_chars=900):
     return summary
 
 
+# ===================== Montagem da newsletter =====================
+
 def normalize_kw(s: str) -> str:
     """Normalização leve (minúsculas + troca simples de acentos comuns)."""
     s = s.lower()
-    # trocas mínimas para 'saúde'/'saude'
     return (s.replace("á", "a").replace("à", "a").replace("â", "a")
              .replace("é", "e").replace("ê", "e")
              .replace("í", "i")
@@ -259,10 +292,29 @@ def enviar_email(conteudo_html):
         srv.send_message(msg)
 
 
+# ===================== Rotina principal =====================
+
+def fetch_rss_fallback(feed_url, max_items=6):
+    try:
+        r = requests.get(feed_url, timeout=20, headers=USER_AGENT)
+        if r.status_code != 200:
+            return []
+        soup = BeautifulSoup(r.text, "xml")
+        out = []
+        for item in soup.select("item")[:max_items]:
+            title = item.title.get_text(strip=True) if item.title else ""
+            link = item.link.get_text(strip=True) if item.link else ""
+            if title and link:
+                out.append((title, link))
+        return out
+    except Exception:
+        return []
+
+
 def rotina():
     driver = get_driver()
     try:
-        login_paywall_examples(driver)  # opcional, implemente se quiser login
+        login_paywall_examples(driver)  # opcional
 
         news_per_source = {}
         health_bucket = []
@@ -270,9 +322,10 @@ def rotina():
         for fonte, sections in SECTIONS.items():
             collected = []
             for section_name, url in sections.items():
+                # Tenta requests primeiro; se vazio, Selenium
                 links = fetch_links_simple(driver, url, max_items=6)
 
-                # Fallback só para NYT se nada veio via HTML
+                # Fallback só para NYT, se nada foi encontrado via HTML
                 if fonte == "NYT" and not links and section_name in NYT_RSS:
                     links = fetch_rss_fallback(NYT_RSS[section_name], max_items=6)
 
@@ -282,7 +335,7 @@ def rotina():
                     summary = summarize_text(text)
                     enriched.append((title, link, summary))
 
-                    # bucket especial de saúde/seguros
+                    # Bucket especial de saúde/seguros
                     t_norm = normalize_kw(title)
                     if any(normalize_kw(k) in t_norm for k in HEALTH_KEYWORDS):
                         health_bucket.append((title, link, summary))
@@ -303,6 +356,6 @@ if __name__ == "__main__":
         if os.path.exists(".env"):
             load_dotenv()
         rotina()
-    except Exception as e:
+    except Exception:
         traceback.print_exc()
         sys.exit(1)
