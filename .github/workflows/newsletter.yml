@@ -1,0 +1,44 @@
+name: Newsletter Diária
+
+# Agenda para 07:00 no fuso de São Paulo (-03:00). 10:00 UTC = 07:00 BRT
+on:
+  schedule:
+    - cron: '0 10 * * *'
+# Também permite disparar manualmente pelo Actions → Run workflow
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      ESTADAO_USER: ${{ secrets.ESTADAO_USER }}
+      ESTADAO_PASS: ${{ secrets.ESTADAO_PASS }}
+      VALOR_USER: ${{ secrets.VALOR_USER }}
+      VALOR_PASS: ${{ secrets.VALOR_PASS }}
+      OGLOBO_USER: ${{ secrets.OGLOBO_USER }}
+      OGLOBO_PASS: ${{ secrets.OGLOBO_PASS }}
+      NYT_USER: ${{ secrets.NYT_USER }}
+      NYT_PASS: ${{ secrets.NYT_PASS }}
+      EMAIL_USER: ${{ secrets.EMAIL_USER }}
+      EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
+      DEST_EMAIL: ${{ secrets.DEST_EMAIL }}
+    steps:
+      - name: Checkout do código
+        uses: actions/checkout@v3
+
+      - name: Configurar Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Instalar Chrome e ChromeDriver
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y chromium-browser chromium-chromedriver
+          sudo ln -s /usr/lib/chromium-browser/chromedriver /usr/bin/chromedriver
+
+      - name: Instalar dependências
+        run: pip install -r requirements.txt
+
+      - name: Executar script de newsletter
+        run: python newsletter.py
