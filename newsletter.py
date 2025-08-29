@@ -7,15 +7,17 @@ Gera e envia uma newsletter diária.
 - Usa Selenium (Chrome headless) com CHROME_BIN/CHROMEDRIVER_BIN
 - Coleta links das seções definidas (requests -> fallback Selenium)
 - Resolve URLs relativas, relaxa filtros de título
+- Dedup global por URL canônica e similaridade de título
 - Para NYT, fallback via RSS se a página HTML não retornar links
 - Monta HTML e envia por SMTP
 """
 
 import os
 import sys
+import re
 import smtplib
 import traceback
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit, urlunsplit
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
@@ -78,7 +80,6 @@ USER_AGENT = {
     )
 }
 
-
 # ===================== Driver Chrome (estável no CI) =====================
 
 def get_driver():
@@ -119,7 +120,6 @@ def get_driver():
     driver.implicitly_wait(0)
     return driver
 
-
 # ===================== Login (opcional; ajustar se quiser) =====================
 
 def login_paywall_examples(driver):
@@ -135,7 +135,6 @@ def login_paywall_examples(driver):
     # ).send_keys(est_user)
     # ...
     pass
-
 
 # ===================== Coleta de links (requests -> fallback Selenium) =====================
 
@@ -162,7 +161,6 @@ def _filter_links(url_base, soup, max_items=6):
                 break
     return items
 
-
 def fetch_links_via_requests(url, max_items=6):
     """Primeira tentativa: pegar links via requests+BS (sem renderer)."""
     try:
@@ -173,7 +171,6 @@ def fetch_links_via_requests(url, max_items=6):
         return _filter_links(url, soup, max_items=max_items)
     except Exception:
         return []
-
 
 def fetch_links_via_selenium(driver, url, max_items=6):
     """Segunda tentativa: Selenium (casos mais dinâmicos)."""
@@ -188,14 +185,12 @@ def fetch_links_via_selenium(driver, url, max_items=6):
     except Exception:
         return []
 
-
 def fetch_links_simple(driver, url, max_items=6):
     """Wrapper: tenta requests antes; se vazio, usa Selenium."""
     links = fetch_links_via_requests(url, max_items=max_items)
     if links:
         return links
     return fetch_links_via_selenium(driver, url, max_items=max_items)
-
 
 # ===================== Download + resumo =====================
 
@@ -214,7 +209,6 @@ def download_article_text(url, timeout=25):
     except Exception:
         return ""
 
-
 def summarize_text(text, max_chars=900):
     """Resumo simples, robusto para CI (sem modelos pesados)."""
     if not text:
@@ -225,8 +219,11 @@ def summarize_text(text, max_chars=900):
         summary = summary[:max_chars].rsplit(" ", 1)[0] + "…"
     return summary
 
+# ===================== Normalização / deduplicação =====================
 
-# ===================== Montagem da newsletter =====================
+STOPWORDS = {"de","da","do","das","dos","para","por","em","no","na","nos","nas",
+             "e","a","o","as","os","um","uma","ao","à","com","sobre","contra","entre",
+             "se","que","porém","mas","ou"}
 
 def normalize_kw(s: str) -> str:
     """Normalização leve (minúsculas + troca simples de acentos comuns)."""
@@ -237,6 +234,57 @@ def normalize_kw(s: str) -> str:
              .replace("ó", "o").replace("ô", "o")
              .replace("ú", "u").replace("ç", "c"))
 
+def normalize_url(u: str) -> str:
+    """
+    URL canônica simples:
+    - remove schema/params/fragment
+    - normaliza host (sem 'www.')
+    - mantém apenas (netloc, path)
+    """
+    try:
+        s = urlsplit(u.strip())
+        host = (s.netloc or "").lower()
+        if host.startswith("www."):
+            host = host[4:]
+        path = (s.path or "").rstrip("/")
+        return urlunsplit(("", host, path, "", ""))  # esquema/params/fragments vazios
+    except Exception:
+        return u
+
+def tokenize_title(t: str):
+    t = normalize_kw(t)
+    t = re.sub(r"[^a-z0-9\s]", " ", t)
+    tokens = [tok for tok in t.split() if tok and tok not in STOPWORDS]
+    return set(tokens)
+
+def title_similarity(t1: str, t2: str) -> float:
+    """Similaridade Jaccard simples entre conjuntos de tokens (0..1)."""
+    a, b = tokenize_title(t1), tokenize_title(t2)
+    if not a or not b:
+        return 0.0
+    inter = len(a & b)
+    uni = len(a | b)
+    return inter / uni
+
+class Deduper:
+    def __init__(self, title_threshold: float = 0.85):
+        self.seen_urls = set()
+        self.titles = []  # títulos aceitos
+        self.title_threshold = title_threshold
+
+    def is_dup(self, title: str, url: str) -> bool:
+        u_norm = normalize_url(url)
+        if u_norm in self.seen_urls:
+            return True
+        for t in self.titles:
+            if title_similarity(t, title) >= self.title_threshold:
+                return True
+        # registra como novo
+        self.seen_urls.add(u_norm)
+        self.titles.append(title)
+        return False
+
+# ===================== Montagem da newsletter =====================
 
 def build_html(news_per_source, health_items):
     """Monta HTML final da newsletter."""
@@ -271,7 +319,6 @@ def build_html(news_per_source, health_items):
     html.append("</body></html>")
     return "\n".join(html)
 
-
 def enviar_email(conteudo_html):
     """Envia o HTML por SMTP usando credenciais do ambiente (secrets)."""
     remetente = os.getenv("EMAIL_USER")
@@ -286,11 +333,9 @@ def enviar_email(conteudo_html):
     msg["To"] = destinatario
     msg.attach(MIMEText(conteudo_html, "html", "utf-8"))
 
-    # SMTP Gmail padrão; ajuste se usar outro provedor
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as srv:
         srv.login(remetente, senha)
         srv.send_message(msg)
-
 
 # ===================== Rotina principal =====================
 
@@ -310,7 +355,6 @@ def fetch_rss_fallback(feed_url, max_items=6):
     except Exception:
         return []
 
-
 def rotina():
     driver = get_driver()
     try:
@@ -318,6 +362,7 @@ def rotina():
 
         news_per_source = {}
         health_bucket = []
+        deduper = Deduper(title_threshold=0.85)
 
         for fonte, sections in SECTIONS.items():
             collected = []
@@ -331,6 +376,10 @@ def rotina():
 
                 enriched = []
                 for title, link in links:
+                    # pular se duplicado globalmente (URL canônica ou título muito parecido)
+                    if deduper.is_dup(title, link):
+                        continue
+
                     text = download_article_text(link)
                     summary = summarize_text(text)
                     enriched.append((title, link, summary))
@@ -348,7 +397,6 @@ def rotina():
 
     finally:
         driver.quit()
-
 
 if __name__ == "__main__":
     try:
