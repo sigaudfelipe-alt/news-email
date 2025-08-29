@@ -3,7 +3,7 @@
 
 """
 Newsletter diária (07:00 America/Sao_Paulo)
-- Estrutura por JORNAL → SEÇÃO (bullets com resumo)
+- Estrutura por JORNAL → SEÇÃO (bullets com resumo) no padrão combinado
 - Especial Saúde/Planos/Seguros
 - Envia somente às 07:00 BRT (a menos que FORCE_SEND_ANYTIME=1)
 - Coleta por editoria correta (filtro por path)
@@ -11,6 +11,7 @@ Newsletter diária (07:00 America/Sao_Paulo)
 - Economia com bloco "Como ler" (explicação)
 - Deduplicação global por URL canônica + similaridade de título
 - requests -> fallback Selenium (headless) quando necessário
+- SMTP com debug, SSL→STARTTLS, 3 tentativas e variáveis para host/port
 """
 
 import os
@@ -239,7 +240,6 @@ def fetch_links_bulk(driver, url, scan_limit=SCAN_LIMIT):
     return fetch_links_via_selenium(driver, url, scan_limit=scan_limit)
 
 def belongs_to_section(url: str, must_parts: list[str]) -> bool:
-    """Garante que o link pertence à editoria (ex.: /politica/ vs /economia/)."""
     path = urlsplit(url).path.lower()
     return any(part in path for part in must_parts)
 
@@ -301,14 +301,12 @@ def fetch_nyt_rss(feed_url, max_items=WANT_PER_SECTION*2):
         for item in soup.select("item")[:max_items]:
             title = item.title.get_text(strip=True) if item.title else ""
             link = item.link.get_text(strip=True) if item.link else ""
-            # tenta description / content:encoded como resumo
             desc = ""
             if item.find("description"):
                 desc = BeautifulSoup(item.description.get_text(), "lxml").get_text(" ", strip=True)
             content_tag = item.find("content:encoded")
             if not desc and content_tag:
                 desc = BeautifulSoup(content_tag.get_text(), "lxml").get_text(" ", strip=True)
-            # fallback extração bruta
             if not desc and link:
                 desc = summarize_text(download_article_text(link))
             if title and link:
@@ -317,15 +315,13 @@ def fetch_nyt_rss(feed_url, max_items=WANT_PER_SECTION*2):
     except Exception:
         return out
 
-# ----------------- Montagem da newsletter (modelo inicial) -----------------
+# ----------------- Montagem da newsletter (padrão acordado) -----------------
 
 def build_html(news_per_source, health_items):
-    """Estrutura igual ao exemplo inicial do chat."""
     html = []
     html.append("<html><body style='font-family:Arial,Helvetica,sans-serif'>")
     html.append("<h2>Resumo diário – 07:00</h2>")
 
-    # Ordem: Estadão, Valor, O Globo, NYT
     ordem = ["Estadão", "Valor", "O Globo", "NYT"]
     for jornal in ordem:
         blocks = news_per_source.get(jornal, [])
@@ -364,24 +360,73 @@ def build_html(news_per_source, health_items):
     html.append("</body></html>")
     return "\n".join(html)
 
-# ----------------- E-mail -----------------
+# ----------------- E-mail (debug + SSL→STARTTLS + retries) -----------------
 
 def enviar_email(conteudo_html):
+    """
+    Envia o HTML por SMTP usando credenciais do ambiente (secrets).
+    - Tenta primeiro SSL (porta 465), depois STARTTLS (porta 587)
+    - Faz até 3 tentativas com pequeno backoff
+    - Loga detalhes úteis no CI (sem expor segredos)
+    É possível sobrescrever host/portas via env:
+        EMAIL_SMTP_HOST, EMAIL_SMTP_SSL_PORT, EMAIL_SMTP_TLS_PORT
+    """
     remetente = os.getenv("EMAIL_USER")
     senha = os.getenv("EMAIL_PASS")
     destinatario = os.getenv("DEST_EMAIL")
     if not (remetente and senha and destinatario):
         raise RuntimeError("EMAIL_USER/EMAIL_PASS/DEST_EMAIL não configurados.")
 
+    host = os.getenv("EMAIL_SMTP_HOST", "smtp.gmail.com")
+    ssl_port = int(os.getenv("EMAIL_SMTP_SSL_PORT", "465"))
+    tls_port = int(os.getenv("EMAIL_SMTP_TLS_PORT", "587"))
+
     msg = MIMEMultipart("alternative")
     msg["Subject"] = "Resumo diário de notícias"
     msg["From"] = remetente
     msg["To"] = destinatario
+    msg["Reply-To"] = remetente
     msg.attach(MIMEText(conteudo_html, "html", "utf-8"))
 
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as srv:
-        srv.login(remetente, senha)
-        srv.send_message(msg)
+    def _try_ssl():
+        import smtplib
+        with smtplib.SMTP_SSL(host, ssl_port, timeout=30) as srv:
+            srv.set_debuglevel(1)  # imprime conversa SMTP no log do Actions
+            srv.login(remetente, senha)
+            return srv.send_message(msg)
+
+    def _try_tls():
+        import smtplib
+        with smtplib.SMTP(host, tls_port, timeout=30) as srv:
+            srv.set_debuglevel(1)
+            srv.ehlo()
+            srv.starttls()
+            srv.ehlo()
+            srv.login(remetente, senha)
+            return srv.send_message(msg)
+
+    last_err = None
+    for attempt in range(1, 4):
+        try:
+            print(f"[mail] Tentativa {attempt}/3 via SSL {host}:{ssl_port} -> To={destinatario}")
+            _try_ssl()
+            print("[mail] Enviado com SSL.")
+            return
+        except Exception as e_ssl:
+            print(f"[mail] Falha SSL: {e_ssl!r}")
+            last_err = e_ssl
+            try:
+                print(f"[mail] Tentativa {attempt}/3 via STARTTLS {host}:{tls_port} -> To={destinatario}")
+                _try_tls()
+                print("[mail] Enviado com STARTTLS.")
+                return
+            except Exception as e_tls:
+                print(f"[mail] Falha STARTTLS: {e_tls!r}")
+                last_err = e_tls
+                import time
+                time.sleep(2 * attempt)
+
+    raise RuntimeError(f"Falha ao enviar e-mail após 3 tentativas: {last_err!r}")
 
 # ----------------- Coleta por seção com filtro de editoria + dedup -----------------
 
@@ -416,23 +461,24 @@ def rotina():
         for jornal, sections in SECTIONS.items():
             collected = []
 
-            # NYT: puxamos via RSS (resumos confiáveis)
+            # NYT via RSS (resumos mais consistentes)
             if jornal == "NYT":
                 for section_name, conf in sections.items():
                     rss = conf.get("rss")
                     if not rss:
                         continue
                     items = []
-                    for title, link, summary in fetch_nyt_rss(rss, max_items=WANT_PER_SECTION * 2):
+                    for (title, link, summary) in fetch_nyt_rss(rss, max_items=WANT_PER_SECTION * 2):
                         if deduper.is_dup(title, link):
                             continue
-                        items.append((title, link, summary, False))
-                        if len(items) >= WANT_PER_SECTION:
-                            break
+                        is_econ = section_name.lower() in {"finance", "business"}
+                        items.append((title, link, summary, is_econ))
                         # bucket de saúde
                         t_norm = normalize_kw(title)
                         if any(normalize_kw(k) in t_norm for k in HEALTH_KEYWORDS):
                             health_bucket.append((title, link, summary))
+                        if len(items) >= WANT_PER_SECTION:
+                            break
                     collected.append((section_name, items))
                 news_per_source[jornal] = collected
                 continue
@@ -444,7 +490,6 @@ def rotina():
                 items = []
                 for (title, link, summary) in collect_section_items(
                         driver, url, must_parts, deduper, want_items=WANT_PER_SECTION):
-                    # marca se é seção econômica para adicionar "Como ler"
                     is_econ = (section_name.lower() in {"economia", "finanças", "empresas"})
                     items.append((title, link, summary, is_econ))
 
