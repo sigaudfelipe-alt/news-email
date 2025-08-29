@@ -8,6 +8,7 @@ Gera e envia uma newsletter diária.
 - Coleta links das seções definidas (requests -> fallback Selenium)
 - Resolve URLs relativas, relaxa filtros de título
 - Dedup global por URL canônica e similaridade de título
+- Garante população por SEÇÃO (tenta buscar mais itens se dedup esvaziar)
 - Para NYT, fallback via RSS se a página HTML não retornar links
 - Monta HTML e envia por SMTP
 """
@@ -42,7 +43,7 @@ SECTIONS = {
     "Valor": {
         "Primeiro Caderno": "https://valor.globo.com/brasil/",
         "Empresas": "https://valor.globo.com/empresas/",
-        "Finanças": "https://valor.globo.com/financas/",  # garantido
+        "Finanças": "https://valor.globo.com/financas/",
     },
     "O Globo": {
         "Primeiro Caderno": "https://oglobo.globo.com/brasil/",
@@ -64,13 +65,10 @@ NYT_RSS = {
 }
 
 HEALTH_KEYWORDS = {
-    # com e sem acento para não depender de libs extras
     "plano de saude", "plano de saúde",
     "saude", "saúde",
     "seguros", "seguro",
-    "health",
-    "health insurance",
-    "insurance",
+    "health", "health insurance", "insurance",
 }
 
 USER_AGENT = {
@@ -123,17 +121,7 @@ def get_driver():
 # ===================== Login (opcional; ajustar se quiser) =====================
 
 def login_paywall_examples(driver):
-    """
-    Se quiser efetuar login em cada site, implemente aqui as rotinas específicas.
-    Credenciais via variáveis de ambiente (GitHub Secrets).
-    """
-    # Exemplo (comentado):
-    # est_user = os.getenv("ESTADAO_USER"); est_pass = os.getenv("ESTADAO_PASS")
-    # driver.get("https://accounts.estadao.com.br/login")
-    # WebDriverWait(driver, 20).until(
-    #     EC.presence_of_element_located((By.CSS_SELECTOR, "input[type=email]"))
-    # ).send_keys(est_user)
-    # ...
+    """Implemente aqui se quiser login nas contas de assinante (opcional)."""
     pass
 
 # ===================== Coleta de links (requests -> fallback Selenium) =====================
@@ -161,18 +149,19 @@ def _filter_links(url_base, soup, max_items=6):
                 break
     return items
 
-def fetch_links_via_requests(url, max_items=6):
+def fetch_links_via_requests(url, scan_limit=40):
     """Primeira tentativa: pegar links via requests+BS (sem renderer)."""
     try:
         r = requests.get(url, timeout=20, headers=USER_AGENT)
         if r.status_code != 200:
             return []
         soup = BeautifulSoup(r.text, "lxml")
-        return _filter_links(url, soup, max_items=max_items)
+        # coletar mais do que o necessário (scan_limit) para repor após dedup
+        return _filter_links(url, soup, max_items=scan_limit)
     except Exception:
         return []
 
-def fetch_links_via_selenium(driver, url, max_items=6):
+def fetch_links_via_selenium(driver, url, scan_limit=40):
     """Segunda tentativa: Selenium (casos mais dinâmicos)."""
     try:
         driver.get(url)
@@ -181,16 +170,19 @@ def fetch_links_via_selenium(driver, url, max_items=6):
         )
         html = driver.page_source
         soup = BeautifulSoup(html, "lxml")
-        return _filter_links(url, soup, max_items=max_items)
+        return _filter_links(url, soup, max_items=scan_limit)
     except Exception:
         return []
 
-def fetch_links_simple(driver, url, max_items=6):
-    """Wrapper: tenta requests antes; se vazio, usa Selenium."""
-    links = fetch_links_via_requests(url, max_items=max_items)
+def fetch_links_bulk(driver, url, scan_limit=40):
+    """
+    Wrapper: tenta requests antes; se vazio, Selenium.
+    Retorna uma lista "longa" (scan_limit) para permitir reposição pós-dedup.
+    """
+    links = fetch_links_via_requests(url, scan_limit=scan_limit)
     if links:
         return links
-    return fetch_links_via_selenium(driver, url, max_items=max_items)
+    return fetch_links_via_selenium(driver, url, scan_limit=scan_limit)
 
 # ===================== Download + resumo =====================
 
@@ -235,19 +227,14 @@ def normalize_kw(s: str) -> str:
              .replace("ú", "u").replace("ç", "c"))
 
 def normalize_url(u: str) -> str:
-    """
-    URL canônica simples:
-    - remove schema/params/fragment
-    - normaliza host (sem 'www.')
-    - mantém apenas (netloc, path)
-    """
+    """URL canônica simples (remove schema/params/fragments, normaliza host)."""
     try:
         s = urlsplit(u.strip())
         host = (s.netloc or "").lower()
         if host.startswith("www."):
             host = host[4:]
         path = (s.path or "").rstrip("/")
-        return urlunsplit(("", host, path, "", ""))  # esquema/params/fragments vazios
+        return urlunsplit(("", host, path, "", ""))
     except Exception:
         return u
 
@@ -286,20 +273,23 @@ class Deduper:
 
 # ===================== Montagem da newsletter =====================
 
-def build_html(news_per_source, health_items):
+def build_html(news_per_source, health_items, show_empty_sections=True):
     """Monta HTML final da newsletter."""
     html = []
     html.append("<html><body style='font-family:Arial,Helvetica,sans-serif'>")
     html.append("<h2>Resumo Diário – 07:00</h2>")
 
     for source, blocks in news_per_source.items():
-        if not blocks:
-            continue
         html.append(f"<h3>{source}</h3>")
         for section, items in blocks:
+            html.append(f"<h4>{section}</h4>")
             if not items:
+                if show_empty_sections:
+                    html.append("<p><em>(sem novidades distintas da editoria principal hoje)</em></p>")
+                else:
+                    html.append("<p>&nbsp;</p>")
                 continue
-            html.append(f"<h4>{section}</h4><ul>")
+            html.append("<ul>")
             for title, link, summary in items:
                 html.append(
                     f"<li><p><strong><a href='{link}'>{title}</a></strong><br>"
@@ -337,6 +327,27 @@ def enviar_email(conteudo_html):
         srv.login(remetente, senha)
         srv.send_message(msg)
 
+# ===================== Coleta por seção com REPOSIÇÃO =====================
+
+def collect_section_items(driver, url, global_deduper, want_items=4, scan_limit=40):
+    """
+    Busca links da seção (scan_limit bem maior que want_items) e
+    adiciona ao resultado apenas aqueles que não sejam duplicados globais.
+    Se muitos forem descartados pelo dedup, tenta preencher até want_items.
+    """
+    raw_links = fetch_links_bulk(driver, url, scan_limit=scan_limit)
+    section_items = []
+    for title, link in raw_links:
+        if global_deduper.is_dup(title, link):
+            continue
+        # Aceitou → enriquecer
+        text = download_article_text(link)
+        summary = summarize_text(text)
+        section_items.append((title, link, summary))
+        if len(section_items) >= want_items:
+            break
+    return section_items
+
 # ===================== Rotina principal =====================
 
 def fetch_rss_fallback(feed_url, max_items=6):
@@ -364,35 +375,41 @@ def rotina():
         health_bucket = []
         deduper = Deduper(title_threshold=0.85)
 
+        # Quantidade alvo por seção (ajuste se quiser)
+        WANT_PER_SECTION = 4
+        SCAN_LIMIT = 40  # quantos links brutos escanear por seção
+
         for fonte, sections in SECTIONS.items():
             collected = []
             for section_name, url in sections.items():
-                # Tenta requests primeiro; se vazio, Selenium
-                links = fetch_links_simple(driver, url, max_items=6)
+                # Coleta com reposição (respeita dedup global, mas tenta preencher a seção)
+                items = collect_section_items(
+                    driver, url, deduper, want_items=WANT_PER_SECTION, scan_limit=SCAN_LIMIT
+                )
 
-                # Fallback só para NYT, se nada foi encontrado via HTML
-                if fonte == "NYT" and not links and section_name in NYT_RSS:
-                    links = fetch_rss_fallback(NYT_RSS[section_name], max_items=6)
+                # Fallback NYT via RSS se seção ficou vazia
+                if fonte == "NYT" and not items and section_name in NYT_RSS:
+                    rss_links = fetch_rss_fallback(NYT_RSS[section_name], max_items=WANT_PER_SECTION * 2)
+                    for title, link in rss_links:
+                        if deduper.is_dup(title, link):
+                            continue
+                        text = download_article_text(link)
+                        summary = summarize_text(text)
+                        items.append((title, link, summary))
+                        if len(items) >= WANT_PER_SECTION:
+                            break
 
-                enriched = []
-                for title, link in links:
-                    # pular se duplicado globalmente (URL canônica ou título muito parecido)
-                    if deduper.is_dup(title, link):
-                        continue
-
-                    text = download_article_text(link)
-                    summary = summarize_text(text)
-                    enriched.append((title, link, summary))
-
-                    # Bucket especial de saúde/seguros
+                # Alimenta bucket especial de saúde/seguros a partir dos itens da seção
+                for title, link, summary in items:
                     t_norm = normalize_kw(title)
                     if any(normalize_kw(k) in t_norm for k in HEALTH_KEYWORDS):
                         health_bucket.append((title, link, summary))
 
-                collected.append((section_name, enriched))
+                collected.append((section_name, items))
+
             news_per_source[fonte] = collected
 
-        html = build_html(news_per_source, health_bucket)
+        html = build_html(news_per_source, health_bucket, show_empty_sections=True)
         enviar_email(html)
 
     finally:
