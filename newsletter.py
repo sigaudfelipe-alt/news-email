@@ -360,7 +360,7 @@ def build_html(news_per_source, health_items):
     html.append("</body></html>")
     return "\n".join(html)
 
-# ----------------- E-mail (debug + SSL→STARTTLS + retries) -----------------
+# ----------------- E-mail (tolerante a env vazios + debug + retries) -----------------
 
 def enviar_email(conteudo_html):
     """
@@ -368,7 +368,8 @@ def enviar_email(conteudo_html):
     - Tenta primeiro SSL (porta 465), depois STARTTLS (porta 587)
     - Faz até 3 tentativas com pequeno backoff
     - Loga detalhes úteis no CI (sem expor segredos)
-    É possível sobrescrever host/portas via env:
+    - Usa defaults seguros se secrets opcionais vierem vazios/invalidos
+    Secrets opcionais:
         EMAIL_SMTP_HOST, EMAIL_SMTP_SSL_PORT, EMAIL_SMTP_TLS_PORT
     """
     remetente = os.getenv("EMAIL_USER")
@@ -377,9 +378,18 @@ def enviar_email(conteudo_html):
     if not (remetente and senha and destinatario):
         raise RuntimeError("EMAIL_USER/EMAIL_PASS/DEST_EMAIL não configurados.")
 
-    host = os.getenv("EMAIL_SMTP_HOST", "smtp.gmail.com")
-    ssl_port = int(os.getenv("EMAIL_SMTP_SSL_PORT", "465"))
-    tls_port = int(os.getenv("EMAIL_SMTP_TLS_PORT", "587"))
+    def _env_int(name: str, default: int) -> int:
+        val = os.getenv(name)
+        if not val:
+            return default
+        try:
+            return int(val)
+        except ValueError:
+            return default
+
+    host = os.getenv("EMAIL_SMTP_HOST") or "smtp.gmail.com"
+    ssl_port = _env_int("EMAIL_SMTP_SSL_PORT", 465)
+    tls_port = _env_int("EMAIL_SMTP_TLS_PORT", 587)
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = "Resumo diário de notícias"
@@ -406,7 +416,7 @@ def enviar_email(conteudo_html):
             return srv.send_message(msg)
 
     last_err = None
-    for attempt in range(1, 4):
+    for attempt in range(1, 3 + 1):
         try:
             print(f"[mail] Tentativa {attempt}/3 via SSL {host}:{ssl_port} -> To={destinatario}")
             _try_ssl()
@@ -430,6 +440,16 @@ def enviar_email(conteudo_html):
 
 # ----------------- Coleta por seção com filtro de editoria + dedup -----------------
 
+def fetch_links_bulk(driver, url, scan_limit=SCAN_LIMIT):
+    links = fetch_links_via_requests(url, scan_limit=scan_limit)
+    if links:
+        return links
+    return fetch_links_via_selenium(driver, url, scan_limit=scan_limit)
+
+def belongs_to_section(url: str, must_parts: list[str]) -> bool:
+    path = urlsplit(url).path.lower()
+    return any(part in path for part in must_parts)
+
 def collect_section_items(driver, url, must_parts, global_deduper, want_items=WANT_PER_SECTION):
     raw_links = fetch_links_bulk(driver, url, scan_limit=SCAN_LIMIT)
     section_items = []
@@ -446,6 +466,30 @@ def collect_section_items(driver, url, must_parts, global_deduper, want_items=WA
     return section_items
 
 # ----------------- Rotina principal -----------------
+
+def fetch_nyt_rss(feed_url, max_items=WANT_PER_SECTION*2):
+    out = []
+    try:
+        r = requests.get(feed_url, timeout=20, headers=USER_AGENT)
+        if r.status_code != 200:
+            return out
+        soup = BeautifulSoup(r.text, "xml")
+        for item in soup.select("item")[:max_items]:
+            title = item.title.get_text(strip=True) if item.title else ""
+            link = item.link.get_text(strip=True) if item.link else ""
+            desc = ""
+            if item.find("description"):
+                desc = BeautifulSoup(item.description.get_text(), "lxml").get_text(" ", strip=True)
+            content_tag = item.find("content:encoded")
+            if not desc and content_tag:
+                desc = BeautifulSoup(content_tag.get_text(), "lxml").get_text(" ", strip=True)
+            if not desc and link:
+                desc = summarize_text(download_article_text(link))
+            if title and link:
+                out.append((title, link, summarize_text(desc)))
+        return out
+    except Exception:
+        return out
 
 def rotina():
     if not should_send_now():
